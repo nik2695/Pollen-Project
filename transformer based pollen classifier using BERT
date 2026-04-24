@@ -1,0 +1,276 @@
+
+Transformer-based Multimodal Pollen Particle Classification
+
+Architecture:
+  - BERT (text encoder) for spatio-temporal features (location + month)
+  - DenseNet (visual encoder) for image features
+  - Transformer Aggregation Module (TAM) for multimodal fusion
+  - Softmax classifier
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import BertModel, BertTokenizer
+import torchvision.models as tv_models
+import math
+
+# Positional Encoding (used inside TAM)
+
+
+class PositionalEncoding(nn.Module):
+    Standard sinusoidal positional encoding
+
+    def __init__(self, d_model: int, max_len: int = 512, dropout: float = 0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2, dtype=torch.float)
+            * (-math.log(10000.0) / d_model)
+        )
+        # Even dims → sin, odd dims → cos  (Eq. 1 & 2)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
+        self.register_buffer("pe", pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, d_model)
+        x = x + self.pe[:, : x.size(1)]
+        return self.dropout(x)
+
+# Text Encoder  (BERT backbone)
+
+
+class TextEncoder(nn.Module):
+    """
+    Pre-trained BERT encoder.
+    Extracts the [CLS] token embedding as the sentence-level representation.
+    sentence-segmentation, and position representations
+    which are all handled internally by BERT.
+    """
+
+    def __init__(self, bert_name: str = "bert-base-uncased", freeze: bool = False):
+        super().__init__()
+        self.bert = BertModel.from_pretrained(bert_name)
+        if freeze:
+            for p in self.bert.parameters():
+                p.requires_grad = False
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        token_type_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Returns (B, hidden_size) CLS representation."""
+        outputs = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+        )
+        return outputs.last_hidden_state[:, 0, :]  # [CLS] token
+
+# Visual Encoder  (DenseNet backbone)
+
+
+class VisualEncoder(nn.Module):
+    """
+    Pre-trained DenseNet-121 visual backbone.
+    Each DenseNet block halves spatial resolution and reduces channels by 8
+    and height by 16 (per the paper).  We strip the classifier head and keep
+    the feature maps.
+    """
+
+    def __init__(self, out_dim: int = 256, pretrained: bool = True):
+        super().__init__()
+        densenet = tv_models.densenet121(
+            weights=tv_models.DenseNet121_Weights.IMAGENET1K_V1 if pretrained else None
+        )
+        
+        self.features = densenet.features  # outputs (B, 1024, H/32, W/32)
+        self.relu = nn.ReLU(inplace=True)
+
+        # 1×1 conv to reduce channel dim from C → d  (Section II-C)
+        self.channel_reduce = nn.Conv2d(1024, out_dim, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        
+        Args:
+            x: (B, 3, H, W)
+        Returns:
+            z: (B, N, out_dim)  where N = (H/32)*(W/32) spatial tokens
+        
+        feat = self.relu(self.features(x))      # (B, 1024, h, w)
+        z = self.channel_reduce(feat)            # (B, d, h, w)
+        B, d, h, w = z.shape
+        z = z.flatten(2).permute(0, 2, 1)       # (B, h*w, d)
+        return z
+
+
+
+# Transformer Aggregation
+
+
+class TransformerAggregationModule(nn.Module):
+    """
+    visual and textual features via a standard Transformer
+    encoder-decoder.
+
+    - Encoder processes the concatenated multimodal token sequence.
+    - Decoder uses N learnable object queries to attend over encoder output.
+    - Output: (B, N, d_model) → average-pooled to (B, d_model).
+    """
+
+    def __init__(
+        self,
+        d_model: int = 256,
+        nhead: int = 8,
+        num_encoder_layers: int = 2,
+        num_decoder_layers: int = 2,
+        dim_feedforward: int = 1024,
+        dropout: float = 0.1,
+        num_queries: int = 16,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.num_queries = num_queries
+
+        self.pos_enc = PositionalEncoding(d_model, dropout=dropout)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model, nhead, dim_feedforward, dropout, batch_first=True
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
+
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model, nhead, dim_feedforward, dropout, batch_first=True
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
+
+        # Learnable object queries (Section II-C)
+        self.query_embed = nn.Embedding(num_queries, d_model)
+
+    def forward(
+        self, visual_tokens: torch.Tensor, text_token: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
+            visual_tokens: (B, Nv, d_model)
+            text_token:    (B, d_model)  – the CLS vector, treated as 1 token
+        Returns:
+            fused: (B, d_model)
+        """
+        # Treat text as a single extra token → (B, 1, d)
+        text_token = text_token.unsqueeze(1)
+
+        # Concatenate along token dimension: (B, Nv+1, d)
+        multimodal = torch.cat([visual_tokens, text_token], dim=1)
+
+        # Add positional encodings
+        multimodal = self.pos_enc(multimodal)
+
+        # Encode
+        memory = self.encoder(multimodal)   # (B, Nv+1, d)
+
+        # Object queries (repeated over batch)
+        B = visual_tokens.size(0)
+        queries = self.query_embed.weight.unsqueeze(0).expand(B, -1, -1)  # (B, Q, d)
+
+        # Decode
+        out = self.decoder(queries, memory)  # (B, Q, d)
+
+        # Aggregate: mean over query dimension → (B, d)
+        fused = out.mean(dim=1)
+        return fused
+
+# Full Pollen Classifier
+
+
+class PollenClassifier(nn.Module):
+    """
+    Full multimodal pollen classifier (Figure 1 in the paper).
+
+    Pipeline:
+        text  ──► BERT ──────────────────────────┐
+                                                  ├──► TAM ──► Linear ──► softmax
+        image ──► DenseNet ──► 1×1 conv ──► flat ┘
+
+    Args:
+        num_classes:    number of pollen species (7 in the paper's dataset)
+        bert_name:      HuggingFace model identifier for BERT
+        d_model:        shared projection dimension for TAM
+        freeze_bert:    whether to freeze BERT weights during training
+        pretrained_cnn: whether to load ImageNet weights for DenseNet
+    """
+
+    def __init__(
+        self,
+        num_classes: int = 7,
+        bert_name: str = "bert-base-uncased",
+        d_model: int = 256,
+        nhead: int = 8,
+        num_encoder_layers: int = 2,
+        num_decoder_layers: int = 2,
+        dim_feedforward: int = 1024,
+        dropout: float = 0.1,
+        num_queries: int = 16,
+        freeze_bert: bool = False,
+        pretrained_cnn: bool = True,
+    ):
+        super().__init__()
+
+        # --- Unimodal backbones ---
+        self.text_encoder = TextEncoder(bert_name, freeze=freeze_bert)
+        bert_hidden = self.text_encoder.bert.config.hidden_size  # 768
+
+        self.visual_encoder = VisualEncoder(out_dim=d_model, pretrained=pretrained_cnn)
+
+        # Linear projections to shared d_model space
+        self.text_proj = nn.Linear(bert_hidden, d_model)
+
+        # --- Transformer Aggregation Module ---
+        self.tam = TransformerAggregationModule(
+            d_model=d_model,
+            nhead=nhead,
+            num_encoder_layers=num_encoder_layers,
+            num_decoder_layers=num_decoder_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            num_queries=num_queries,
+        )
+
+        # --- Classifier head (Eq. 3: O = Ws·b + bs) ---
+        self.classifier = nn.Linear(d_model, num_classes)
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        token_type_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            images:         (B, 3, H, W)
+            input_ids:      (B, L)
+            attention_mask: (B, L)
+            token_type_ids: (B, L)
+        Returns:
+            logits: (B, num_classes)
+        """
+        # 1. Text features
+        text_feat = self.text_encoder(input_ids, attention_mask, token_type_ids)
+        text_feat = self.text_proj(text_feat)   # (B, d_model)
+
+        # 2. Visual features
+        vis_tokens = self.visual_encoder(images) # (B, Nv, d_model)
+
+        # 3. Multimodal fusion via TAM
+        fused = self.tam(vis_tokens, text_feat)  # (B, d_model)
+
+        # 4. Classification
+        logits = self.classifier(fused)          # (B, num_classes)
+        return logits
